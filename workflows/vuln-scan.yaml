@@ -1,0 +1,85 @@
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: vuln-scan
+spec:
+  schedule: "17 3 * * *"
+  timezone: UTC
+  concurrencyPolicy: Forbid
+  workflowSpec:
+    entrypoint: main
+    # Nada aqui cria Workflow: o fix é chamado por templateRef dentro desta mesma execução. Os pods não montam token; só o executor do
+    # Argo usa a conta de workflows/rbac.yaml (workflowtaskresults). Com templateRef só valem os templates do vuln-fix: volume, conta e securityContext são os deste Workflow.
+    automountServiceAccountToken: false
+    executor:
+      serviceAccountName: vuln-fixer-executor
+    arguments:
+      parameters:
+        - name: repository
+          value: open-eda-labs/demo-service
+        # "1" só depois de as releases novas do demo-parent e da demo-lib estarem publicadas (ADR-0005).
+        - name: publish-service
+          value: "0"
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 10001
+      runAsGroup: 10001
+      fsGroup: 10001
+      seccompProfile:
+        type: RuntimeDefault
+    volumes:
+      - name: tmp
+        emptyDir: {}
+    # Sem artifact repository: scan, fix, publish e notify trocam arquivos por este volume (/work).
+    volumeClaimTemplates:
+      - metadata:
+          name: work
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 2Gi
+    templates:
+      - name: main
+        dag:
+          tasks:
+            - name: scan
+              template: scan
+            # Uma execução de fix por rodada, com todos os eventos do scan.
+            - name: fix
+              dependencies: [scan]
+              templateRef:
+                name: vuln-fix
+                template: main
+              arguments:
+                parameters:
+                  - name: traceparent
+                    value: "{{tasks.scan.outputs.parameters.traceparent}}"
+      # Clona os três repositórios no volume e grava os SHAs (/work/shas.json); a retentativa é barata e reaproveita o volume.
+      - name: scan
+        retryStrategy:
+          limit: "3"
+          backoff:
+            duration: 1m
+            factor: "2"
+        container:
+          image: ghcr.io/open-eda-labs/agent-workflows-steps:0.2.0
+          command: [python, -m, steps.scan.scan]
+          env:
+            - name: REPOSITORY
+              value: "{{workflow.parameters.repository}}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: work
+              mountPath: /work
+        outputs:
+          parameters:
+            - name: traceparent
+              valueFrom:
+                path: /work/traceparent

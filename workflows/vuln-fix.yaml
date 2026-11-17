@@ -1,0 +1,122 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: vuln-fix
+spec:
+  entrypoint: main
+  arguments:
+    parameters:
+      - name: publish-service
+        value: "0"
+      # traceparent W3C da rodada (o scan gera; ao rodar este template sozinho, informe um)
+      - name: traceparent
+  automountServiceAccountToken: false
+  executor:
+    serviceAccountName: vuln-fixer-executor
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  volumes:
+    - name: tmp
+      emptyDir: {}
+  # O laboratório não tem artifact repository: os passos trocam arquivos por este volume (/work), que o scan enche (repos, shas.json, events).
+  volumeClaimTemplates:
+    - metadata:
+        name: work
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi
+  templates:
+    # Uma execução por rodada: lê os eventos do scan em /work e corrige todos os pacotes juntos.
+    - name: main
+      inputs:
+        parameters:
+          - name: traceparent
+      steps:
+        - - name: fix
+            template: fix
+            arguments:
+              parameters:
+                - name: traceparent
+                  value: "{{inputs.parameters.traceparent}}"
+        # Só o fix terminar com patch verificado (stdout `ready`) segue para o passo com credencial.
+        - - name: publish
+            template: publish
+            when: "{{steps.fix.outputs.result}} == ready"
+            arguments:
+              parameters:
+                - name: traceparent
+                  value: "{{inputs.parameters.traceparent}}"
+        - - name: notify
+            template: notify
+            when: "{{steps.fix.outputs.result}} == ready"
+            arguments:
+              parameters:
+                - name: traceparent
+                  value: "{{inputs.parameters.traceparent}}"
+    # Sem credencial de escrita. Rede só para Maven Central e base OSV: NetworkPolicy do cluster (não incluída aqui).
+    # N2_HOOK (comando do passo com modelo, vazio por padrão) não está ligado: sem ele pacote que quebra volta à versão anterior.
+    # Sem retryStrategy: a única retentativa é a do mvn (rede do Maven Central); repetir a rodada inteira custa dezenas de minutos.
+    - name: fix
+      inputs:
+        parameters:
+          - name: traceparent
+      container:
+        image: ghcr.io/open-eda-labs/agent-workflows-steps:0.2.0
+        command: [python, -m, steps.fix.fix]
+        env:
+          - name: TRACEPARENT
+            value: "{{inputs.parameters.traceparent}}"
+        securityContext: &restricted
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        volumeMounts: &mounts
+          - name: tmp
+            mountPath: /tmp
+          - name: work
+            mountPath: /work
+    # Único passo com credencial de escrita: token curto de GitHub App (contents e pull requests só nos repositórios alvo).
+    - name: publish
+      inputs:
+        parameters:
+          - name: traceparent
+      container:
+        image: ghcr.io/open-eda-labs/agent-workflows-steps:0.2.0
+        command: [python, -m, steps.publish.publish]
+        env:
+          - name: GITHUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: vuln-fixer-github-app
+                key: token
+          - name: PUBLISH_SERVICE
+            value: "{{workflow.parameters.publish-service}}"
+          - name: TRACEPARENT
+            value: "{{inputs.parameters.traceparent}}"
+        securityContext: *restricted
+        volumeMounts: *mounts
+    - name: notify
+      inputs:
+        parameters:
+          - name: traceparent
+      container:
+        image: ghcr.io/open-eda-labs/agent-workflows-steps:0.2.0
+        command: [python, -m, steps.notify.notify]
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: slack-webhook
+                key: url
+          - name: TRACEPARENT
+            value: "{{inputs.parameters.traceparent}}"
+        securityContext: *restricted
+        volumeMounts: *mounts

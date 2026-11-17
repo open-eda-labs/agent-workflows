@@ -12,3 +12,30 @@ jobs:
   lint:
     # Convenção da org: o lint mora no repositório .github.
     uses: open-eda-labs/.github/.github/workflows/lint.yml@main
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # Pendência: pinar por SHA de commit (D-40).
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5.3.0
+        with:
+          python-version: "3.12"
+      - name: Instalar dependências
+        run: pip install -r requirements-dev.txt
+      - name: pytest
+        run: python -m pytest -q
+
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      # Só constrói (sem push): pega erro de Dockerfile, de apt e de pip antes de a tag existir.
+      - name: docker build
+        run: docker build --tag agent-workflows-steps:ci .
