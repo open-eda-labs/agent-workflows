@@ -134,3 +134,23 @@ Limites desta medição:
 - A primeira rodada deixou o patch de parent e lib pronto; aqui eles foram reaplicados das cópias da medição anterior (aplicam limpos nos HEADs atuais), não regerados pelo `fix` desta versão do código.
 - O caminho de quebra do serviço (build ou teste vermelho depois da subida) só foi coberto por teste com executor falso, não por Maven; a rodada da lib (parent com release mais nova que o `<parent>` da lib) também.
 - Uma rodada só, sobre o Maven Central de 2026-11-18.
+
+## Ensaio do N2 (2026-11-18)
+
+Ensaio da ligação do gancho N2, não medição do G-P5: uma unidade, uma tentativa por modelo.
+
+| Item | Valor |
+| --- | --- |
+| Unidade | snakeyaml 1.33 para 2.7 (`org.yaml@1.33`), que quebra a compilação da `demo-lib` (`Scenarios.java`, `new Constructor(Scenario.class)`) |
+| Base | cópias dos commits atuais de `demo-parent`, `demo-lib` e `demo-service`; eventos da reexecução de 2026-11-17 |
+| Caminho | `fix.trial` real (vermelho na lib), `fix.n2` real com `N2_HOOK=n2-adapter` (agent-step-images), Cline CLI 3.0.74, `mvn verify` do adaptador, `fix.trial` de novo com o patch |
+| Fora do caminho | re-scan trocado por stub (sem osv-scanner na sessão); `~/.m2` isolado sem os `labs.demo` de rodadas antigas (ver abaixo); sem LiteLLM: o Cline falou direto com o endpoint |
+
+| Modelo | Resultado | Passos do agente | Tokens (entrada, saída) | Duração do N2 |
+| --- | --- | --- | --- | --- |
+| falso (roteiro em `agent-step-images/tests/fake_openai.py`) | patch de 1 linha, verify verde, prova final verde | 4 | 0, 0 | 43 s |
+| `google/gemma-4-31b-it`, NVIDIA NIM (`integrate.api.nvidia.com`) | patch de 1 linha, verify verde, prova final verde | 5 (`run_commands`, `read_files`, `editor`, `run_commands`, `submit_and_exit`) | 28.007, 538 | 112 s |
+
+O Gemma 4 31B chamou as ferramentas do Cline (`tools` em JSON Schema, D-09) sem `response_format`. O patch dos dois foi o mesmo: `new Constructor(Scenario.class, new org.yaml.snakeyaml.LoaderOptions())`. A duração do N2 inclui o harness, o `mvn verify` do adaptador e a prova final (parent, lib e service).
+
+Prova verde por engano: no primeiro ensaio, a prova da lib ficou verde para h2 e snakeyaml porque `update-parent -DparentVersion=<pv>` (sem colchetes) escolheu um `demo-parent` 1.0.2 que sobrou no `~/.m2` da sessão, e não o 1.0.1 que a prova acabara de instalar. Com o `~/.m2` isolado, h2 volta a quebrar nos testes da lib, como na medição. No pod o `~/.m2` nasce vazio, mas uma release do parent no GitHub Packages acima da `pv` provavelmente teria o mesmo efeito (não verificado): a corrigir no `fix` (fixar a versão exata, `[pv]`, como a rodada de release já faz).

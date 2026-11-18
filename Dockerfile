@@ -1,11 +1,15 @@
-# Imagem única dos passos sem modelo (scan, fix, publish, notify). Versões pinadas (D-40).
+# Imagem única dos passos (scan, fix, publish, notify); só o fix chama o modelo, pelo gancho N2. Versões pinadas (D-40).
 # Bases fixadas por digest do índice multi-arquitetura (conferido no registry em 2026-11-17).
 FROM golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS osv-scanner
 RUN CGO_ENABLED=0 GOBIN=/out go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.7.1
 
-FROM maven:3.9.11-eclipse-temurin-21@sha256:6fdc855a6ed81d288ca7ca37ac6ff5e9308b612485c0801d70b25a858c83d237
+# Base: imagem do harness do N2 (agent-step-images: JDK 21, Maven 3.9.11, git, python3, Cline CLI e /opt/n2/n2-adapter, o N2_HOOK do fix).
+# Trocar de harness é trocar só esta linha (G-P5). Ela já vem da maven:3.9.11-eclipse-temurin-21 fixada por digest.
+# shortcut: tag sem digest, porque a imagem ainda não foi publicada; fixar por digest no primeiro push do agent-step-images
+FROM ghcr.io/open-eda-labs/agent-step-images:0.1.0
+USER root
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git python3 python3-venv \
+    && apt-get install -y --no-install-recommends python3-venv \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt .
