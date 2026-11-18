@@ -31,11 +31,20 @@ jobs:
 
   image:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4.2.2
         with:
           persist-credentials: false
+      # A base é a imagem do harness (ADR-0007). Constrói do agent-step-images na branch de mesmo nome do PR (senão na main)
+      # com a tag que o Dockerfile espera; o docker build usa a imagem local antes do registry.
+      - name: Construir o harness (agent-step-images)
+        env:
+          B: ${{ github.head_ref || github.ref_name }}
+        run: |
+          git clone -q --depth 1 --branch "$B" https://github.com/open-eda-labs/agent-step-images harness \
+            || git clone -q --depth 1 https://github.com/open-eda-labs/agent-step-images harness
+          docker build --tag ghcr.io/open-eda-labs/agent-step-images:0.1.0 harness
       # Só constrói (sem push): pega erro de Dockerfile, de apt e de pip antes de a tag existir.
       - name: docker build
         run: docker build --tag agent-workflows-steps:ci .
