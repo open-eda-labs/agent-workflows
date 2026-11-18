@@ -184,8 +184,8 @@ def _trial(base, us, keep):
         plugin(p, "set", f"-DnewVersion={pv}")
         # (repo, comandos de versão, goal de build); o goal do serviço é verify, o da lib e do parent é install
         steps = [(p, [], "install"),
-                 (lib, [("update-parent", f"-DparentVersion={pv}"), ("set", f"-DnewVersion={lv}")], "install"),
-                 (svc, [("update-parent", f"-DparentVersion={pv}"), ("set-property", "-Dproperty=demo-lib.version", f"-DnewVersion={lv}")], "verify")]
+                 (lib, [("update-parent", f"-DparentVersion=[{pv}]"), ("set", f"-DnewVersion={lv}")], "install"),
+                 (svc, [("update-parent", f"-DparentVersion=[{pv}]"), ("set-property", "-Dproperty=demo-lib.version", f"-DnewVersion={lv}")], "verify")]
     for repo, edits, goal in steps:
         for g, *a in edits:
             plugin(repo, g, *a)
