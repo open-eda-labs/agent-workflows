@@ -2,10 +2,11 @@
 
 Uso: GITHUB_TOKEN=<token curto de GitHub App> python -m steps.publish.publish [/work/fix] [/work/publish] [/work/repos]
 Entrada: a saída do fix em /work/fix (result.json, shas.json, <repo>/patch.diff, fixes/, events/, recommendations/). Um PR draft por
-repositório por rodada, na ordem parent, lib, service, sobre o commit que o scan viu (shas.json), nunca sobre main de novo. O PR do
-serviço só abre com PUBLISH_SERVICE=1 (releases de parent e lib já publicadas). Antes de qualquer push, `check_patches` valida os patches.
-O branch é `vuln-fix/<12 hex do sha256 do patch do parent>`: com PR aberto nesse branch o passo não faz nada e reaproveita o número.
-Saída: prs.json, result.json e recommendations/ em /work/publish (as do fix mais a `pr_opened`, com o PR do parent, onde o fix nasce).
+repositório com patch por rodada, na ordem parent, lib, service, sobre o commit que o scan viu (shas.json), nunca sobre main de novo. O fix só
+grava patch do serviço na rodada que sobe parent e lib para releases já publicadas, então o PR do serviço abre quando o patch existe.
+Antes de qualquer push, `check_patches` valida os patches. O branch é `vuln-fix/<12 hex do sha256 do primeiro patch>` (o do parent, onde o
+fix nasce; na rodada de release, o da lib ou do serviço): com PR aberto nesse branch o passo não faz nada e reaproveita o número.
+Saída: prs.json, result.json e recommendations/ em /work/publish (as do fix mais a `pr_opened`, com o primeiro PR da rodada).
 Nunca faz merge nem tag. DRY_RUN=1: sem nenhum acesso à rede; usa os repositórios de /work/repos, aplica e comita o patch localmente, imprime a
 requisição do PR em vez de enviá-la e grava prs.json e result.json com números de PR fictícios (`dry_run: true`).
 """
@@ -49,7 +50,7 @@ def pr_body(repo, result):
              SERVICE: f"Sobe o parent para {v[PARENT]} e a demo-lib para {v[LIB]}; nenhuma versão de terceiro mora no serviço."}[repo]
     lines = ["Correção automática N1 (ADR-0005, sem modelo).", "", intro, "", f"Corrigidos ({len(done)}):", ""]
     lines += [f"- {p['package']}: {p['from']} para {p['to']}" for p in done] or ["- nenhum"]
-    lines += ["", f"Última release publicada e ainda acusada, sem versão corrigida ({len(stuck)}):", ""]
+    lines += ["", f"Ainda acusados no re-scan final, sem correção nesta rodada ({len(stuck)}):", ""]
     lines += [f"- {p['package']}: {p['from']} para {p['to']}; restam {len(p['restam'])} advisories" for p in stuck] or ["- nenhum"]
     lines += ["", f"Não corrigidos, precisa de migração de código ({len(back)}):", ""]
     lines += [f"- {p['package']}: {p['from']} ficou; {REASON[p['kind']]} em {p['repo']}" for p in back] or ["- nenhum"]
@@ -133,24 +134,24 @@ def main(in_dir="/work/fix", out="/work/publish", repos="/work/repos"):
     check_trace(events)
     patches = {r: (in_dir / r / "patch.diff").read_bytes() for r in REPOS if (in_dir / r / "patch.diff").exists()}
     patches = {r: p for r, p in patches.items() if p}
-    if PARENT not in patches:
-        die("sem patch do demo-parent: nada a publicar")
+    if not patches:
+        die("sem patch: nada a publicar")
     check_patches({r: p.decode() for r, p in patches.items()})
     shas = {r: hashlib.sha256(p).hexdigest() for r, p in patches.items()}
-    branch = f"vuln-fix/{shas[PARENT][:12]}"
+    lead = next(iter(patches))  # o primeiro de REPOS: o parent, ou, na rodada de release, a lib ou o serviço
+    branch = f"vuln-fix/{shas[lead][:12]}"
     n = sum(p["status"] == "corrigido" for p in result["packages"])
     prs = []
-    for repo in REPOS:
-        if repo not in patches or (repo == SERVICE and os.environ.get("PUBLISH_SERVICE") != "1"):
-            continue
-        title = f"fix(deps): {n} pacotes para a última release ({repo})" if repo != SERVICE else f"fix(deps): demo-parent {result['versions'][PARENT]} e demo-lib {result['versions'][LIB]}"
+    for repo in patches:
+        title = f"fix(deps): demo-parent {result['versions'][PARENT]} e demo-lib {result['versions'][LIB]}" if repo == SERVICE else \
+            f"fix(deps): {n} pacotes para a última release ({repo})" if n else f"fix(deps): demo-lib no demo-parent {result['versions'][PARENT]}"
         number = open_pr(org, repo, commits[repo], branch, patches[repo], title, pr_body(repo, result), dry, repos)
         prs.append({"repository": f"{org}/{repo}", "number": number or len(prs) + 1, **({"dry_run": True} if dry else {})})  # sem rede, número fictício
     out.mkdir(parents=True, exist_ok=True)
     (out / "recommendations").mkdir(exist_ok=True)
     shutil.copytree(in_dir / "recommendations", out / "recommendations", dirs_exist_ok=True)
     for name, (event, fix) in fixes.items():
-        rec = recommendation(event, "pr_opened", fix, pr_number=prs[0]["number"], patch_sha256=shas[PARENT])
+        rec = recommendation(event, "pr_opened", fix, pr_number=prs[0]["number"], patch_sha256=shas[lead])
         (out / "recommendations" / name).write_text(json.dumps(rec, ensure_ascii=False))
     (out / "prs.json").write_text(json.dumps(prs))
     (out / "result.json").write_text(json.dumps({**result, **({"dry_run": True} if dry else {})}, ensure_ascii=False, indent=1))

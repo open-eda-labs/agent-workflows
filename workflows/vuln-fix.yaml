@@ -6,8 +6,6 @@ spec:
   entrypoint: main
   arguments:
     parameters:
-      - name: publish-service
-        value: "0"
       # traceparent W3C da rodada (o scan gera; ao rodar este template sozinho, informe um)
       - name: traceparent
   automountServiceAccountToken: false
@@ -23,6 +21,9 @@ spec:
   volumes:
     - name: tmp
       emptyDir: {}
+    - name: maven-settings
+      configMap:
+        name: maven-settings
   # O laboratório não tem artifact repository: os passos trocam arquivos por este volume (/work), que o scan enche (repos, shas.json, events).
   volumeClaimTemplates:
     - metadata:
@@ -60,7 +61,8 @@ spec:
               parameters:
                 - name: traceparent
                   value: "{{inputs.parameters.traceparent}}"
-    # Sem credencial de escrita. Rede só para Maven Central e base OSV: NetworkPolicy do cluster (não incluída aqui).
+    # Sem credencial de escrita (o token do GitHub Packages é só de leitura). Rede só para Maven Central, base OSV, github.com (tags) e
+    # maven.pkg.github.com: NetworkPolicy do cluster (não incluída aqui). Rodada de release: ver a docstring de steps/fix/fix.py.
     # N2_HOOK (comando do passo com modelo, vazio por padrão) não está ligado: sem ele pacote que quebra volta à versão anterior.
     # Sem retryStrategy: a única retentativa é a do mvn (rede do Maven Central); repetir a rodada inteira custa dezenas de minutos.
     - name: fix
@@ -73,16 +75,27 @@ spec:
         env:
           - name: TRACEPARENT
             value: "{{inputs.parameters.traceparent}}"
+          # GitHub Packages exige token até para ler (workflows/maven-settings.yaml).
+          - name: MAVEN_ARGS
+            value: -s /etc/maven/settings.xml
+          - name: GITHUB_PACKAGES_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: github-packages-read
+                key: token
         securityContext: &restricted
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
           capabilities:
             drop: [ALL]
-        volumeMounts: &mounts
+        volumeMounts:
           - name: tmp
             mountPath: /tmp
           - name: work
             mountPath: /work
+          - name: maven-settings
+            mountPath: /etc/maven
+            readOnly: true
     # Único passo com credencial de escrita: token curto de GitHub App (contents e pull requests só nos repositórios alvo).
     - name: publish
       inputs:
@@ -97,12 +110,14 @@ spec:
               secretKeyRef:
                 name: vuln-fixer-github-app
                 key: token
-          - name: PUBLISH_SERVICE
-            value: "{{workflow.parameters.publish-service}}"
           - name: TRACEPARENT
             value: "{{inputs.parameters.traceparent}}"
         securityContext: *restricted
-        volumeMounts: *mounts
+        volumeMounts: &mounts
+          - name: tmp
+            mountPath: /tmp
+          - name: work
+            mountPath: /work
     - name: notify
       inputs:
         parameters:

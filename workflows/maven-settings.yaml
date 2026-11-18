@@ -1,0 +1,40 @@
+# settings.xml do Maven dos passos scan e fix: lê demo-parent e demo-lib do GitHub Packages da org (ADR-0005). Sem valor secreto: o token vem do
+# Secret `github-packages-read` (chave `token`, criado à mão, só leitura de pacotes), que os dois passos expõem em GITHUB_PACKAGES_TOKEN e o Maven interpola.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maven-settings
+data:
+  settings.xml: |
+    <settings>
+      <servers>
+        <server>
+          <id>github</id>
+          <username>open-eda-labs</username>
+          <password>${env.GITHUB_PACKAGES_TOKEN}</password>
+        </server>
+        <server>
+          <id>github-demo-lib</id>
+          <username>open-eda-labs</username>
+          <password>${env.GITHUB_PACKAGES_TOKEN}</password>
+        </server>
+      </servers>
+      <profiles>
+        <profile>
+          <id>github-packages</id>
+          <activation>
+            <activeByDefault>true</activeByDefault>
+          </activation>
+          <repositories>
+            <repository>
+              <id>github</id>
+              <url>https://maven.pkg.github.com/open-eda-labs/demo-parent</url>
+            </repository>
+            <repository>
+              <id>github-demo-lib</id>
+              <url>https://maven.pkg.github.com/open-eda-labs/demo-lib</url>
+            </repository>
+          </repositories>
+        </profile>
+      </profiles>
+    </settings>

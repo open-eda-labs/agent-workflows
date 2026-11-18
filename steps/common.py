@@ -28,7 +28,7 @@ def traceparent():
 def check_trace(events):
     """Todos os eventos da rodada têm o mesmo trace_id (e o de TRACEPARENT, se definido)."""
     ids = {e["traceparent"].split("-")[1] for e in events}
-    if len(ids) > 1 or (os.environ.get("TRACEPARENT") and ids != {os.environ["TRACEPARENT"].split("-")[1]}):
+    if len(ids) > 1 or (os.environ.get("TRACEPARENT") and ids and ids != {os.environ["TRACEPARENT"].split("-")[1]}):
         die(f"eventos da rodada com trace_id diferentes entre si ou de TRACEPARENT: {sorted(ids)}")
 
 

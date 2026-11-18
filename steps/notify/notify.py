@@ -18,7 +18,7 @@ def message(result, prs):
     return {
         "text": "\n".join([
             f"Vuln fixer, rodada {result['round']}: {n['corrigido']} pacotes corrigidos, {n['voltou']} voltaram (precisam de migração de código), "
-            f"{n['sem_correcao']} sem versão corrigida publicada. Advisories restantes no re-scan: {result['advisories_restantes']}.",
+            f"{n['sem_correcao']} ainda acusados. Advisories restantes no re-scan: {result['advisories_restantes']}.",
             *[f"Revisar PR: https://github.com/{p['repository']}/pull/{p['number']}" for p in prs],
             *([f"trace_id: {os.environ['TRACEPARENT'].split('-')[1]}"] if os.environ.get("TRACEPARENT") else []),
         ]),
