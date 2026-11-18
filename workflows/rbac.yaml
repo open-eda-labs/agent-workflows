@@ -1,0 +1,36 @@
+# Conta do executor do Argo (wait container) dos dois workflows. Os pods principais seguem com automountServiceAccountToken: false.
+# Aplicar no namespace do laboratório; o Role dá só o que o executor precisa para gravar o resultado do passo.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vuln-fixer-executor
+---
+# O Argo procura o Secret `<conta>.service-account-token` (sem automount, não há token projetado).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vuln-fixer-executor.service-account-token
+  annotations:
+    kubernetes.io/service-account.name: vuln-fixer-executor
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vuln-fixer-executor
+rules:
+  - apiGroups: [argoproj.io]
+    resources: [workflowtaskresults]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vuln-fixer-executor
+subjects:
+  - kind: ServiceAccount
+    name: vuln-fixer-executor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vuln-fixer-executor
