@@ -49,7 +49,7 @@ def world(tmp_path, monkeypatch):
         sh("clone", "--bare", str(seed), str(bare), cwd=tmp_path)
         (seed / "pom.xml").write_text("<v>1.0.1</v>\n")
         (in_dir / repo).mkdir(parents=True)
-        (in_dir / repo / "patch.diff").write_text(subprocess.run(["git", "diff", "--no-color"], cwd=seed, capture_output=True, text=True, check=True).stdout)
+        (in_dir / repo / "patch.diff").write_text("" if repo == "demo-service" else subprocess.run(["git", "diff", "--no-color"], cwd=seed, capture_output=True, text=True, check=True).stdout)
         sh("checkout", "pom.xml", cwd=seed)
         (seed / "outro.txt").write_text("main avançou depois do scan\n")  # o PR tem de sair do SHA do scan, não deste commit
         sh("add", ".", cwd=seed)
@@ -59,7 +59,6 @@ def world(tmp_path, monkeypatch):
     cfg.write_text(f'[url "file://{tmp_path}/"]\n\tinsteadOf = https://github.com/\n')
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
     monkeypatch.setenv("GITHUB_TOKEN", "token-de-teste")
-    monkeypatch.delenv("PUBLISH_SERVICE", raising=False)
     (in_dir / "result.json").write_text(json.dumps(RESULT))
     (in_dir / "shas.json").write_text(json.dumps(shas))
     (in_dir / "events").mkdir()
@@ -108,13 +107,44 @@ def test_dry_run_without_network_writes_prs_and_result_for_notify(world, tmp_pat
     assert "Revisar PR: https://github.com/open-eda-labs/demo-lib/pull/2" in capsys.readouterr().out
 
 
-def test_dry_run_service_pr_only_after_releases(world, tmp_path, monkeypatch):
+SVC_PATCH = "diff --git a/pom.xml b/pom.xml\n--- a/pom.xml\n+++ b/pom.xml\n@@ -1 +1 @@\n-<v>1.0.0</v>\n+<v>1.0.1</v>\n"
+
+
+def test_service_pr_opens_by_itself_when_the_round_has_a_service_patch(world, tmp_path, monkeypatch):
     monkeypatch.setenv("DRY_RUN", "1")
-    monkeypatch.setenv("PUBLISH_SERVICE", "1")
     posts = capture(monkeypatch)
+    publish.main(world, tmp_path / "out", tmp_path / "repos")
+    assert [u.split("/")[-2] for u, _ in posts] == ["demo-parent", "demo-lib"]  # rodada de fix: o serviço não tem patch, não há PR dele
+    posts.clear()
+    (world / "demo-service" / "patch.diff").write_text(SVC_PATCH)
     publish.main(world, tmp_path / "out", tmp_path / "repos")
     assert [u.split("/")[-2] for u, _ in posts] == ["demo-parent", "demo-lib", "demo-service"]
     assert posts[2][1]["title"] == "fix(deps): demo-parent 1.0.1 e demo-lib 1.0.1"
+    posts.clear()
+    for r in ("demo-parent", "demo-lib"):  # rodada de release: só o serviço; o branch e o pr_opened vêm dele
+        (world / r / "patch.diff").write_text("")
+    publish.main(world, tmp_path / "out", tmp_path / "repos")
+    assert [u.split("/")[-2] for u, _ in posts] == ["demo-service"]
+    assert posts[0][1]["head"] == "vuln-fix/" + hashlib.sha256(SVC_PATCH.encode()).hexdigest()[:12]
+    rec = json.loads((tmp_path / "out" / "recommendations" / f"{event_name(EVENT)}.json").read_text())
+    assert rec["fix"]["pr_number"] == 1 and rec["fix"]["patch_sha256"] == hashlib.sha256(SVC_PATCH.encode()).hexdigest()
+
+
+def test_nothing_to_publish_without_any_patch(world, tmp_path, monkeypatch):
+    for r in publish.REPOS:
+        (world / r / "patch.diff").write_text("")
+    with pytest.raises(SystemExit):
+        publish.main(world, tmp_path / "out", tmp_path / "repos")
+
+
+def test_lib_only_round_titles_the_pr_by_the_parent(world, tmp_path, monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "1")
+    posts = capture(monkeypatch)
+    (world / "demo-parent" / "patch.diff").write_text("")
+    (world / "result.json").write_text(json.dumps({**RESULT, "packages": []}))
+    (world / "fixes" / f"{event_name(EVENT)}.json").unlink()
+    publish.main(world, tmp_path / "out", tmp_path / "repos")
+    assert [u.split("/")[-2] for u, _ in posts] == ["demo-lib"] and posts[0][1]["title"] == "fix(deps): demo-lib no demo-parent 1.0.1"
 
 
 def test_pr_body_lists_fixed_and_not_fixed_with_reason():
@@ -213,7 +243,7 @@ def test_notify_dry_run_one_message_with_pr_links(tmp_path, capsys, monkeypatch)
     req = json.loads(out)
     assert req["POST"] == "$SLACK_WEBHOOK_URL"
     text = req["body"]["text"]
-    assert "1 pacotes corrigidos, 2 voltaram" in text and "1 sem versão corrigida publicada" in text
+    assert "1 pacotes corrigidos, 2 voltaram" in text and "1 ainda acusados." in text
     assert "Revisar PR: https://github.com/open-eda-labs/demo-parent/pull/7" in text and "Revisar PR: https://github.com/open-eda-labs/demo-lib/pull/8" in text
     assert text.endswith("trace_id: " + "ab" * 16) and "cdcd" not in text
     assert req["body"]["mrkdwn"] is False and req["body"]["unfurl_links"] is False

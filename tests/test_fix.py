@@ -179,8 +179,10 @@ def fake_trial(tmp_path, red, together=(), residual=(), needs=None):
     return trial
 
 
-def run_main(world, tmp_path, monkeypatch, **kw):
+def run_main(world, tmp_path, monkeypatch, plan=({}, {}), **kw):
     monkeypatch.setattr(fix, "trial", fake_trial(tmp_path, **kw))
+    monkeypatch.setattr(fix, "release", lambda repo: None)
+    monkeypatch.setattr(fix, "release_plan", lambda base, tags: plan)  # sem release nova por padrão
     out = tmp_path / "out"
     fix.main(world, out)
     return out, json.loads((out / "result.json").read_text())
@@ -197,8 +199,9 @@ def test_loop_reverts_failing_unit_and_ends_green(world, tmp_path, monkeypatch, 
     assert s["jetty-server"][0] == "sem_correcao" and s["commons-text"][0] == "corrigido" and s["log4j-core"][0] == "corrigido"
     assert result["advisories_restantes"] == sum(e["data"]["package"] == "org.eclipse.jetty:jetty-server" for e in EVENTS)
     assert capsys.readouterr().out.strip() == "ready"
-    for r in fix.REPOS:  # um patch.diff por repositório alterado
+    for r in (fix.PARENT, fix.LIB):  # um patch.diff por repositório alterado; o serviço não tem release a que apontar
         assert (out / r / "patch.diff").read_text().startswith("diff --git")
+    assert not (out / fix.SERVICE).exists()
     assert result["versions"] == {"demo-parent": "1.0.1", "demo-lib": "1.0.1"}
     shas = json.loads((world / "shas.json").read_text())
     assert json.loads((out / "shas.json").read_text()) == shas  # o publish trabalha nos mesmos SHAs
@@ -314,3 +317,94 @@ def test_residual_collects_ids_and_aliases():
 
 def test_patch_version():
     assert fix.patch_version("1.0.0") == "1.0.1" and fix.patch_version("1.0.9") == "1.0.10"
+
+
+LS = "aaa\trefs/tags/v1.0.0\nbbb\trefs/tags/v1.0.1\nbbb\trefs/tags/v1.0.1^{}\nccc\trefs/tags/v1.0.10\nddd\trefs/tags/v2.0.0-rc1\neee\trefs/tags/v3.0\nfff\trefs/tags/release-9.9.9\nggg\trefs/tags/v1.0.2-beta.1\nhhh\trefs/heads/v8.8.8\n"
+
+
+def test_latest_tag_is_highest_stable_ignoring_prerelease_and_odd_tags():
+    assert fix.latest_tag(LS) == "1.0.10"  # 1.0.10 > 1.0.2 na ordem numérica; v2.0.0-rc1, v3.0, release-9.9.9 e branch ficam de fora
+    assert fix.latest_tag("") is None and fix.latest_tag("a\trefs/tags/v1.0.0-rc1\n") is None
+
+
+def poms(tmp_path, svc=("1.0.0", "1.0.0"), lib_parent="1.0.1"):
+    """Três repositórios com só o pom.xml: `svc` = (<parent>, demo-lib.version) do serviço."""
+    block = lambda v: f"<parent>\n<groupId>labs.demo</groupId>\n<artifactId>demo-parent</artifactId>\n<version>{v}</version>\n</parent>\n"
+    for r, text in {"demo-parent": "<artifactId>demo-parent</artifactId>\n<version>1.0.1</version>\n",
+                    "demo-lib": block(lib_parent) + "<artifactId>demo-lib</artifactId>\n<version>1.0.1</version>\n",
+                    "demo-service": block(svc[0]) + f"<artifactId>demo-service</artifactId>\n<version>0.1.0</version>\n<properties><demo-lib.version>{svc[1]}</demo-lib.version></properties>\n"}.items():
+        (tmp_path / r).mkdir()
+        (tmp_path / r / "pom.xml").write_text(text)
+    return {r: tmp_path / r for r in fix.REPOS}
+
+
+def test_release_plan_service_follows_new_tags(tmp_path):
+    edits, v = fix.release_plan(poms(tmp_path), ("1.0.1", "1.0.1"))
+    assert edits == {"demo-service": [("update-parent", "-DparentVersion=[1.0.1]"), ("set-property", "-Dproperty=demo-lib.version", "-DnewVersion=1.0.1")]}
+    assert v == {"demo-parent": "1.0.1", "demo-lib": "1.0.1"}
+
+
+def test_release_plan_only_what_is_newer(tmp_path):
+    edits, v = fix.release_plan(poms(tmp_path, svc=("1.0.1", "1.0.0")), ("1.0.1", "1.0.1"))
+    assert edits == {"demo-service": [("set-property", "-Dproperty=demo-lib.version", "-DnewVersion=1.0.1")]} and v["demo-parent"] == "1.0.1"
+
+
+@pytest.mark.parametrize("tags", [("1.0.0", "1.0.0"), (None, None), ("0.9.0", "1.0.0")])
+def test_release_plan_nothing_new(tmp_path, tags):  # igual, sem tag ou tag mais velha que o referenciado
+    assert fix.release_plan(poms(tmp_path), tags) == ({}, {})
+
+
+def test_release_plan_lib_behind_parent_goes_first(tmp_path):
+    edits, v = fix.release_plan(poms(tmp_path, lib_parent="1.0.0"), ("1.0.1", "1.0.1"))
+    assert list(edits) == ["demo-lib", "demo-service"] and edits["demo-service"] == []
+    assert edits["demo-lib"] == [("update-parent", "-DparentVersion=[1.0.1]"), ("set", "-DnewVersion=1.0.2")] and v == {"demo-parent": "1.0.1", "demo-lib": "1.0.2"}
+
+
+def test_release_plan_lib_already_on_parent_tag_does_not_block_service(tmp_path):
+    edits, _ = fix.release_plan(poms(tmp_path), ("1.0.1", "1.0.1"))
+    assert list(edits) == ["demo-service"]
+
+
+def test_release_reads_remote_tags_from_local_remote(tmp_path, monkeypatch):
+    r = tmp_path / "demo-parent"
+    r.mkdir()
+    sh(r, "init", "-b", "main"), sh(r, "commit", "-q", "--allow-empty", "-m", "x")
+    for t in ("v1.0.0", "v1.0.1", "v1.1.0-rc1"):
+        sh(r, "tag", t)
+    monkeypatch.setattr(fix, "REMOTE", str(tmp_path))
+    assert fix.release("demo-parent") == "1.0.1"
+    with pytest.raises(SystemExit):
+        fix.release("inexistente")
+
+
+SERVICE_ROUND = ({"demo-service": [("update-parent", "-DparentVersion=[1.0.1]")]}, {"demo-parent": "1.0.1", "demo-lib": "1.0.1"})
+
+
+def test_service_round_green_writes_only_service_patch(world, tmp_path, monkeypatch, capsys):
+    out, result = run_main(world, tmp_path, monkeypatch, plan=SERVICE_ROUND, red=set(), residual={"org.eclipse.jetty:jetty-server"})
+    assert capsys.readouterr().out.strip() == "ready" and result["versions"] == SERVICE_ROUND[1]
+    assert (out / fix.SERVICE / "patch.diff").read_text().startswith("diff --git")
+    s = status(result)
+    assert s["commons-text"][0] == "corrigido" and s["jetty-server"][0] == "sem_correcao" and len(result["packages"]) == len({e["data"]["package"] for e in EVENTS})
+
+
+def test_service_round_that_breaks_has_no_service_patch_without_hook(world, tmp_path, monkeypatch, capsys):
+    out, result = run_main(world, tmp_path, monkeypatch, plan=SERVICE_ROUND, red={"release"})
+    assert capsys.readouterr().out.strip() == "done" and not list(out.glob("*/patch.diff")) and result["versions"] == {}
+    assert {v[0] for v in status(result).values()} == {"voltou"}
+    recs = [json.loads(p.read_text()) for p in (out / "recommendations").glob("*.json")]
+    assert len(recs) == len(EVENTS) and {r["status"] for r in recs} == {"failed"}
+
+
+def test_service_round_n2_hook_patch_makes_it_green(world, tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("N2_HOOK", hook(tmp_path, 'printf x > "$2/patch.diff"'))
+    out, result = run_main(world, tmp_path, monkeypatch, plan=SERVICE_ROUND, red={"release"})
+    assert capsys.readouterr().out.strip() == "ready" and (out / fix.SERVICE / "patch.diff").exists()
+    assert set(levels(out).values()) == {"N2"}
+
+
+def test_lib_round_has_lib_patch_and_no_recommendations(world, tmp_path, monkeypatch, capsys):
+    plan = ({"demo-lib": [("update-parent", "-DparentVersion=[1.0.1]")], "demo-service": []}, {"demo-parent": "1.0.1", "demo-lib": "1.0.2"})
+    out, result = run_main(world, tmp_path, monkeypatch, plan=plan, red=set())
+    assert capsys.readouterr().out.strip() == "ready" and result["packages"] == [] and not list((out / "fixes").glob("*.json")) and not list((out / "recommendations").glob("*.json"))
+    assert (out / fix.LIB / "patch.diff").read_text().startswith("diff --git")

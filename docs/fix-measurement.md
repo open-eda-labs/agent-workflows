@@ -102,3 +102,55 @@ Reconstruí o estado final a partir dos três `patch.diff` (aplicados em clones 
 
 Depois das correções da revisão (laço, volume de trabalho, SHAs fixados, `DRY_RUN` completo) e da renomeação do pacote da lib para `labs.demo.lib`, o fluxo inteiro rodou de novo sobre clones dos três repositórios: scan e fix reais, publish e notify em `DRY_RUN`. O resultado se repetiu: 95 advisories em 26 pacotes, 16 corrigidos, 10 voltaram, 46 advisories restantes, os mesmos pacotes em cada grupo. O scan levou 14 s e o fix cerca de 10 min 30 s; publish e notify terminaram sem rede e sem credenciais. Uma revisão independente, num cluster k3d, chegou aos mesmos números com a versão anterior do código.
 
+
+## Segunda rodada: o serviço depois da release de parent e lib (2026-11-18)
+
+Medição da rodada que vem depois do merge e da tag de parent e lib: o `fix` lê as tags, vê a release nova e só o serviço sobe. O GitHub Packages não é acessível daqui, então a release foi simulada (veja os limites).
+
+| Item | Valor |
+| --- | --- |
+| Base | cópias dos HEADs atuais: `demo-parent` `c086cd9`, `demo-lib` `8845066`, `demo-service` `4a42046` (os três originais não foram tocados) |
+| Release simulada | nas cópias de parent e lib, os `patch.diff` da primeira medição (parent 1.0.0 para 1.0.1 com os pacotes subidos e os 3 transitivos; lib com `<parent>` 1.0.1 e versão 1.0.1) aplicados, commitados e com a tag `v1.0.1`; `mvn install` das duas no `~/.m2`. Mais três tags que a detecção tem de ignorar: `v1.0.2-rc1`, `release-9.0.0` (nas duas cópias) |
+| Detecção | `git ls-remote --tags` contra os remotos locais (`REMOTE_BASE`): maior tag estável 1.0.1 nos dois (a `v1.0.2-rc1` e a `release-9.0.0` ignoradas); o serviço referencia 1.0.0 e 1.0.0: release nova, rodada do serviço. A lib já aponta para o parent 1.0.1, então não há rodada da lib |
+| Execução | `scan` (13 s, 95 advisories, os mesmos de antes), `fix` (58 s, 3 provas: base, `release` sozinha, `release` de novo no passo 2; stdout `ready`), `publish` e `notify` em `DRY_RUN` |
+
+Resultado:
+
+| Medida | Resultado |
+| --- | --- |
+| Serviço, de para | `<parent>` demo-parent 1.0.0 para 1.0.1; `demo-lib.version` 1.0.0 para 1.0.1. O patch só troca essas duas linhas |
+| Build | verde (`mvn verify` do serviço; parent e lib 1.0.1 resolvidos do `~/.m2`) |
+| Testes | 11 de 11, 0 falhas, 0 erros (relatório do surefire numa cópia limpa com o patch aplicado) |
+| Re-scan | 46 advisories em 10 pacotes, os mesmos 10 da primeira rodada (xstream 18, jetty-server 6, jetty-http 5, h2 4, commons-configuration2 4, commons-beanutils 3, spring-core 2, spring-web 2, jetty-security 1, snakeyaml 1 na contagem por advisory); confirmado por um re-scan independente da mesma cópia |
+| Pacotes | 16 de 26 corrigidos (a release os trouxe); 10 ainda acusados, sem tentativa de migração: o gancho N2 não estava ligado, e a rodada do serviço não tenta migrar código, só sobe as versões |
+| PR do serviço | abriria: `publish` em `DRY_RUN` produziu 1 PR draft no `demo-service`, título `fix(deps): demo-parent 1.0.1 e demo-lib 1.0.1`, e o validador de patch aceitou (só `<parent>` e `demo-lib.version`) |
+| Divergência do esperado | nenhuma: parent e lib 1.0.1, build e testes verdes, 46 advisories |
+
+Achado da medição, já corrigido: com `-DparentVersion=1.0.1` o `versions:update-parent` escolheu `1.0.2`, porque o `mvn install` da prova da base (que acontece antes, no mesmo `~/.m2`) deixa o parent em patch+1, e o plugin trata o valor como "esta versão ou a maior disponível". O fix passa agora `-DparentVersion=[1.0.1]` (versão exata). Num pod do cluster a mesma coisa aconteceria, e o `~/.m2` do pod é onde a base instala.
+
+Limites desta medição:
+
+- Release simulada: a leitura de tags foi contra remotos locais e a resolução de parent e lib 1.0.1 foi do `~/.m2` (instalados das cópias), não do GitHub Packages nem do github.com. A leitura autenticada do GitHub Packages, o `settings.xml` com token e o `ls-remote` real não foram exercitados. O `settings.xml` só foi lido pelo Maven (`help:effective-settings`).
+- A primeira rodada deixou o patch de parent e lib pronto; aqui eles foram reaplicados das cópias da medição anterior (aplicam limpos nos HEADs atuais), não regerados pelo `fix` desta versão do código.
+- O caminho de quebra do serviço (build ou teste vermelho depois da subida) só foi coberto por teste com executor falso, não por Maven; a rodada da lib (parent com release mais nova que o `<parent>` da lib) também.
+- Uma rodada só, sobre o Maven Central de 2026-11-18.
+
+## Ensaio do N2 (2026-11-18)
+
+Ensaio da ligação do gancho N2, não medição do G-P5: uma unidade, uma tentativa por modelo.
+
+| Item | Valor |
+| --- | --- |
+| Unidade | snakeyaml 1.33 para 2.7 (`org.yaml@1.33`), que quebra a compilação da `demo-lib` (`Scenarios.java`, `new Constructor(Scenario.class)`) |
+| Base | cópias dos commits atuais de `demo-parent`, `demo-lib` e `demo-service`; eventos da reexecução de 2026-11-17 |
+| Caminho | `fix.trial` real (vermelho na lib), `fix.n2` real com `N2_HOOK=n2-adapter` (agent-step-images), Cline CLI 3.0.74, `mvn verify` do adaptador, `fix.trial` de novo com o patch |
+| Fora do caminho | re-scan trocado por stub (sem osv-scanner na sessão); `~/.m2` isolado sem os `labs.demo` de rodadas antigas (ver abaixo); sem LiteLLM: o Cline falou direto com o endpoint |
+
+| Modelo | Resultado | Passos do agente | Tokens (entrada, saída) | Duração do N2 |
+| --- | --- | --- | --- | --- |
+| falso (roteiro em `agent-step-images/tests/fake_openai.py`) | patch de 1 linha, verify verde, prova final verde | 4 | 0, 0 | 43 s |
+| `google/gemma-4-31b-it`, NVIDIA NIM (`integrate.api.nvidia.com`) | patch de 1 linha, verify verde, prova final verde | 5 (`run_commands`, `read_files`, `editor`, `run_commands`, `submit_and_exit`) | 28.007, 538 | 112 s |
+
+O Gemma 4 31B chamou as ferramentas do Cline (`tools` em JSON Schema, D-09) sem `response_format`. O patch dos dois foi o mesmo: `new Constructor(Scenario.class, new org.yaml.snakeyaml.LoaderOptions())`. A duração do N2 inclui o harness, o `mvn verify` do adaptador e a prova final (parent, lib e service).
+
+Prova verde por engano: no primeiro ensaio, a prova da lib ficou verde para h2 e snakeyaml porque `update-parent -DparentVersion=<pv>` (sem colchetes) escolheu um `demo-parent` 1.0.2 que sobrou no `~/.m2` da sessão, e não o 1.0.1 que a prova acabara de instalar. Com o `~/.m2` isolado, h2 volta a quebrar nos testes da lib, como na medição. No pod o `~/.m2` nasce vazio, mas uma release do parent no GitHub Packages acima da `pv` provavelmente teria o mesmo efeito (não verificado): a corrigir no `fix` (fixar a versão exata, `[pv]`, como a rodada de release já faz).

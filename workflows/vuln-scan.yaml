@@ -17,9 +17,6 @@ spec:
       parameters:
         - name: repository
           value: open-eda-labs/demo-service
-        # "1" só depois de as releases novas do demo-parent e da demo-lib estarem publicadas (ADR-0005).
-        - name: publish-service
-          value: "0"
     securityContext:
       runAsNonRoot: true
       runAsUser: 10001
@@ -30,6 +27,9 @@ spec:
     volumes:
       - name: tmp
         emptyDir: {}
+      - name: maven-settings
+        configMap:
+          name: maven-settings
     # Sem artifact repository: scan, fix, publish e notify trocam arquivos por este volume (/work).
     volumeClaimTemplates:
       - metadata:
@@ -68,6 +68,14 @@ spec:
           env:
             - name: REPOSITORY
               value: "{{workflow.parameters.repository}}"
+            # Depois da release o serviço ainda referencia o parent e a lib antigos: o Maven os lê do GitHub Packages (workflows/maven-settings.yaml).
+            - name: MAVEN_ARGS
+              value: -s /etc/maven/settings.xml
+            - name: GITHUB_PACKAGES_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-packages-read
+                  key: token
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -78,6 +86,9 @@ spec:
               mountPath: /tmp
             - name: work
               mountPath: /work
+            - name: maven-settings
+              mountPath: /etc/maven
+              readOnly: true
         outputs:
           parameters:
             - name: traceparent

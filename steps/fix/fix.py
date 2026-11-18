@@ -1,6 +1,10 @@
 """Passo fix N1 (ADR-0005; sem modelo, sem credencial de escrita): última release dos pacotes acusados, parent → lib → service.
 
 Uso: python -m steps.fix.fix [/work] [/work/fix]
+Rodada de release (sem estado): lê as tags `vX.Y.Z` de demo-parent e demo-lib no remoto (REMOTE_BASE, padrão https://github.com/open-eda-labs) e compara com
+o que o pom do serviço referencia (`<parent>` e `demo-lib.version`). Há release nova: a rodada só sobe o serviço para elas (a lib antes, se o seu
+`<parent>` está atrás do parent), com o mesmo laço e o mesmo gancho N2, e só então grava patch do serviço; sem gancho, ou se o gancho não resolve, o
+serviço não tem patch. O Maven resolve parent e lib (settings.xml do GitHub Packages no cluster); este código não sabe de onde vêm.
 Entrada: /work/events/*.json, /work/shas.json e /work/repos/{demo-parent,demo-lib,demo-service} (clones do scan, levados ao SHA de shas.json).
 O alvo de cada pacote é a última release no Maven Central (versions-maven-plugin; pré-release fora). O fix nasce no parent
 (versões) e na lib; o serviço só sobe parent e lib. "Corrigido" = build verde + testes verdes + re-scan sem os advisories.
@@ -31,6 +35,7 @@ from steps.scan.scan import event_name, scan
 
 # shortcut: topologia fixa do app de demonstração (REPOS, demo-lib.version); tirar da convenção do pom quando houver um segundo app
 PARENT, LIB, SERVICE = REPOS = ("demo-parent", "demo-lib", "demo-service")
+REMOTE = os.environ.get("REMOTE_BASE", "https://github.com/open-eda-labs")  # repositórios públicos: ls-remote sem token
 PLUGIN = "org.codehaus.mojo:versions-maven-plugin:2.19.1"
 # Pré-release (alpha, beta, rc, milestone...) não é versão publicada (ADR-0005). maven.version.ignore é regex de correspondência total.
 PRE_RELEASE = r"(?i).*[-._](alpha|beta|rc|cr|m|b|ea|milestone|preview|pre|pr|dev|snapshot|nightly)([-._]?[0-9]+)*"
@@ -67,6 +72,44 @@ def plugin(cwd, goal, *args):
 
 def patch_version(v):
     return re.sub(r"[0-9]+$", lambda m: str(int(m.group()) + 1), v)
+
+
+def num(v):
+    return tuple(int(x) for x in re.findall(r"[0-9]+", v))
+
+
+def latest_tag(ls_remote):
+    """Maior `vX.Y.Z` de uma saída de `git ls-remote --tags`; pré-release e tags fora do padrão não contam. None se não há."""
+    found = [m[1] for line in ls_remote.splitlines() if (m := re.fullmatch(r"[0-9a-f]+\s+refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)", line.strip()))]
+    return max(found, key=num, default=None)
+
+
+def release(repo):
+    r = subprocess.run(["git", "ls-remote", "--tags", f"{REMOTE}/{repo}"], capture_output=True, text=True)
+    if r.returncode:
+        die(f"git ls-remote --tags de {repo} falhou:\n" + r.stderr[-500:])
+    return latest_tag(r.stdout)
+
+
+def release_plan(base, tags):
+    """({repo: edições do versions-maven-plugin}, versões que o PR cita) da rodada de release, ou ({}, {}) sem release nova. `tags`: (parent, lib).
+    A versão do parent vai entre colchetes (exata): sem eles o plugin escolhe a maior que o ~/.m2 já tem, e o `mvn install` da base deixa lá patch+1.
+    Parent com release mais nova que o `<parent>` da lib: só a lib sobe (antes de qualquer outra subida). Senão, o serviço sobe parent e lib."""
+    pom = lambda repo: (base[repo] / "pom.xml").read_text()
+    parent_of = lambda repo: re.search(r"<parent>.*?<artifactId>demo-parent</artifactId>\s*<version>([^<]+)</version>", pom(repo), re.S)[1]
+    newer = lambda tag, cur: tag if tag and num(tag) > num(cur) else cur
+    parent, lib = tags
+    if newer(parent, parent_of(LIB)) != parent_of(LIB):
+        v = {PARENT: parent, LIB: patch_version(own_version(base[LIB], LIB))}
+        return {LIB: [("update-parent", f"-DparentVersion=[{parent}]"), ("set", f"-DnewVersion={v[LIB]}")], SERVICE: []}, v
+    lib_now = re.search(r"<demo-lib\.version>([^<]+)<", pom(SERVICE))[1]
+    v = {PARENT: newer(parent, parent_of(SERVICE)), LIB: newer(lib, lib_now)}
+    edits = []
+    if v[PARENT] != parent_of(SERVICE):
+        edits.append(("update-parent", f"-DparentVersion=[{v[PARENT]}]"))
+    if v[LIB] != lib_now:
+        edits.append(("set-property", "-Dproperty=demo-lib.version", f"-DnewVersion={v[LIB]}"))
+    return ({SERVICE: edits}, v) if edits else ({}, {})
 
 
 def own_version(repo, artifact):
@@ -131,14 +174,18 @@ def _trial(base, us, keep):
     d = pathlib.Path(tempfile.mkdtemp())
     for r in REPOS:
         shutil.copytree(base[r], d / r, ignore=shutil.ignore_patterns("target"))
-    p, lib, svc = (d / r for r in REPOS)
-    pv, lv = patch_version(own_version(p, PARENT)), patch_version(own_version(lib, LIB))
-    edit_parent(p, us)
-    plugin(p, "set", f"-DnewVersion={pv}")
-    # (repo, comandos de versão, goal de build); o goal do serviço é verify, o da lib e do parent é install
-    steps = [(p, [], "install"),
-             (lib, [("update-parent", f"-DparentVersion={pv}"), ("set", f"-DnewVersion={lv}")], "install"),
-             (svc, [("update-parent", f"-DparentVersion={pv}"), ("set-property", "-Dproperty=demo-lib.version", f"-DnewVersion={lv}")], "verify")]
+    svc = d / SERVICE
+    if rel := next((u["release"] for u in us if "release" in u), None):  # rodada de release: parent e lib já estão publicados, só as edições do plano
+        steps = [(d / r, e, "verify" if r == SERVICE else "install") for r, e in rel.items()]
+    else:
+        p, lib = d / PARENT, d / LIB
+        pv, lv = patch_version(own_version(p, PARENT)), patch_version(own_version(lib, LIB))
+        edit_parent(p, us)
+        plugin(p, "set", f"-DnewVersion={pv}")
+        # (repo, comandos de versão, goal de build); o goal do serviço é verify, o da lib e do parent é install
+        steps = [(p, [], "install"),
+                 (lib, [("update-parent", f"-DparentVersion=[{pv}]"), ("set", f"-DnewVersion={lv}")], "install"),
+                 (svc, [("update-parent", f"-DparentVersion=[{pv}]"), ("set-property", "-Dproperty=demo-lib.version", f"-DnewVersion={lv}")], "verify")]
     for repo, edits, goal in steps:
         for g, *a in edits:
             plugin(repo, g, *a)
@@ -223,12 +270,15 @@ def main(in_dir="/work", out="/work/fix"):
     shas = json.loads((in_dir / "shas.json").read_text())
     for r in REPOS:  # o commit que o scan viu, não o que main virou depois
         subprocess.run(["git", "checkout", "-q", "--force", "--detach", shas[r]], cwd=base[r], check=True)
+    edits, rel_versions = release_plan(base, (release(PARENT), release(LIB)))
     out.mkdir(parents=True, exist_ok=True)
     shutil.copy(in_dir / "shas.json", out)
     first = trial(base, [])  # sem unidades: prova que a base está verde, o piso do "sempre verde"
     if not first["ok"]:
         die(f"a base não fecha verde em {first['repo']} ({first['kind']}):\n" + first["log"])
     all_units = units(events, (base[PARENT] / "pom.xml").read_text())
+    if edits:  # release nova: uma unidade só; na rodada da lib nenhum advisory é dela (o serviço só é reconstruído)
+        all_units = [{"key": "release", "carriers": set(), "release": edits, "packages": {} if LIB in edits else {e["data"]["package"]: e["data"]["installed_version"] for e in events}}]
     # 1. cada unidade sozinha: ["verde" ou a prova vermelha]
     alone = {u["key"]: trial(base, [u]) for u in all_units}
     chosen = [u for u in all_units if alone[u["key"]]["ok"]]
@@ -278,17 +328,21 @@ def main(in_dir="/work", out="/work/fix"):
     versions = {}
     if chosen:
         for r in REPOS:
+            if r == SERVICE and not edits:  # sem release publicada o serviço não tem a que apontar
+                continue
             diff = subprocess.run(["git", "diff", "--no-color"], cwd=final["dir"] / r, capture_output=True, text=True, check=True).stdout
             (out / r).mkdir(exist_ok=True)
             (out / r / "patch.diff").write_text(diff)
-        versions = {PARENT: own_version(final["dir"] / PARENT, PARENT), LIB: own_version(final["dir"] / LIB, LIB)}
+        versions = rel_versions or {PARENT: own_version(final["dir"] / PARENT, PARENT), LIB: own_version(final["dir"] / LIB, LIB)}
         shutil.rmtree(final["dir"], ignore_errors=True)
 
     for sub in ("fixes", "recommendations"):
         (out / sub).mkdir(exist_ok=True)
     patched = {u["key"] for u in all_units if "patch" in u}  # o verde da unidade veio de patch do gancho N2
     for e in events:
-        d, row = e["data"], by[e["data"]["package"]]
+        d, row = e["data"], by.get(e["data"]["package"])
+        if not row:
+            continue
         level = {"level": "N2" if row["unit"] in patched else "N1"}
         gone = not {d["advisory_id"], *d.get("aliases", [])} & set(row.get("restam", []))
         to = {"to_version": row["to"]} if row.get("to") else {}
@@ -300,7 +354,7 @@ def main(in_dir="/work", out="/work/fix"):
             (out / "fixes" / f"{event_name(e)}.json").write_text(json.dumps({**to, **level, "ci_status": "pending", "rescan": "clean", "evidence": ev}, ensure_ascii=False))
             continue
         else:
-            ev = [ref(EVIDENCE, "rescan", "advisory presente na última release publicada")]
+            ev = [ref(EVIDENCE, "rescan", "advisory ainda presente no re-scan final")]
             rec = recommendation(e, "no_change", {**to, **level, "ci_status": "passed", "rescan": "still_vulnerable", "evidence": ev})
         (out / "recommendations" / f"{event_name(e)}.json").write_text(json.dumps(rec, ensure_ascii=False))
     shutil.copytree(in_dir / "events", out / "events", dirs_exist_ok=True)
